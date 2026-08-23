@@ -19,11 +19,11 @@ INVALID_CHARS = set('/\\:*?"<>|')
 
 
 class RandomImagePlugin(Star):
-    """关键词随机图库。
+    """关键词随机图库(按会话隔离)。
 
     整条消息精确等于某个分类名或其别名时,随机发送该分类下的一张图片/GIF。
     图库通过中文语句管理:添加(直接带图或引用图片消息)、别名、列表、删除、删除分类。
-    图片按内容 sha256 命名,同分类内自动去重。
+    每个群聊/私聊拥有独立图库,互不可见。图片按内容 sha256 命名,同分类内自动去重。
     """
 
     def __init__(self, context: Context):
@@ -32,10 +32,10 @@ class RandomImagePlugin(Star):
         self.images_dir = self.data_dir / "images"
         self.images_dir.mkdir(parents=True, exist_ok=True)
         self.categories_file = self.data_dir / "categories.json"
-        # category name -> list of aliases
-        self.categories: dict[str, list[str]] = {}
-        # exact trigger word -> category name
-        self._trigger_map: dict[str, str] = {}
+        # session key -> {category name -> [aliases]}
+        self.categories: dict[str, dict[str, list[str]]] = {}
+        # session key -> {exact trigger word -> category name}
+        self._trigger_maps: dict[str, dict[str, str]] = {}
         if self.categories_file.exists():
             try:
                 self.categories = json.loads(
@@ -44,18 +44,34 @@ class RandomImagePlugin(Star):
             except (json.JSONDecodeError, OSError) as e:
                 logger.error(f"[random_image] failed to load categories.json: {e}")
                 self.categories = {}
-        self._rebuild_trigger_map()
+        self._rebuild_trigger_maps()
 
-    def _rebuild_trigger_map(self) -> None:
-        """Rebuilds the exact keyword -> category lookup table from self.categories."""
-        self._trigger_map = {}
-        for category, aliases in self.categories.items():
-            self._trigger_map.setdefault(category, category)
-            for alias in aliases:
-                self._trigger_map.setdefault(alias, category)
+    def _session_key(self, event: AstrMessageEvent) -> str:
+        """Returns a filesystem-safe storage key for the chat session.
+
+        Args:
+            event: The incoming message event.
+
+        Returns:
+            A sanitized string derived from event.unified_msg_origin,
+            whose raw format is platform_name:message_type:session_id.
+        """
+        origin = event.unified_msg_origin or "unknown"
+        return "".join("_" if c in INVALID_CHARS or c.isspace() else c for c in origin)
+
+    def _rebuild_trigger_maps(self) -> None:
+        """Rebuilds the per-session keyword -> category tables from self.categories."""
+        self._trigger_maps = {}
+        for session, categories in self.categories.items():
+            trigger_map = {}
+            for category, aliases in categories.items():
+                trigger_map.setdefault(category, category)
+                for alias in aliases:
+                    trigger_map.setdefault(alias, category)
+            self._trigger_maps[session] = trigger_map
 
     def _save_categories(self) -> None:
-        """Persists the category mapping to disk and rebuilds the trigger map."""
+        """Persists the category mapping to disk and rebuilds the trigger maps."""
         try:
             self.categories_file.write_text(
                 json.dumps(self.categories, ensure_ascii=False, indent=2),
@@ -63,7 +79,7 @@ class RandomImagePlugin(Star):
             )
         except OSError as e:
             logger.error(f"[random_image] failed to save categories.json: {e}")
-        self._rebuild_trigger_map()
+        self._rebuild_trigger_maps()
 
     def _name_error(self, name: str) -> str | None:
         """Validates a category name or alias.
@@ -82,10 +98,11 @@ class RandomImagePlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def add_image(self, event: AstrMessageEvent):
-        """添加 分类名 [别名...]:添加图片到分类(消息直接带图,或引用一条含图消息)"""
+        """添加 分类名 [别名...]:添加图片到本会话的分类(消息直接带图,或引用一条含图消息)"""
         parts = event.message_str.split()
         if len(parts) < 2 or parts[0] != "添加":
             return
+        session = self._session_key(event)
         category, aliases = parts[1], parts[2:]
 
         err = self._name_error(category)
@@ -125,7 +142,7 @@ class RandomImagePlugin(Star):
             event.stop_event()
             return
 
-        cat_dir = self.images_dir / category
+        cat_dir = self.images_dir / session / category
         cat_dir.mkdir(parents=True, exist_ok=True)
         saved = duplicate = failed = 0
         for seg in image_segs[:MAX_BATCH]:
@@ -145,15 +162,16 @@ class RandomImagePlugin(Star):
                 failed += 1
                 logger.warning(f"[random_image] failed to save image: {e}")
 
-        # Register the category and every non-conflicting alias.
-        bound = self.categories.setdefault(category, [])
+        # Register the category and every non-conflicting alias in this session.
+        trigger_map = self._trigger_maps.setdefault(session, {})
+        bound = self.categories.setdefault(session, {}).setdefault(category, [])
         skipped_aliases = []
         for alias in aliases:
             if (
                 not self._name_error(alias)
                 and alias != category
                 and alias not in bound
-                and alias not in self._trigger_map
+                and alias not in trigger_map
             ):
                 bound.append(alias)
             else:
@@ -178,23 +196,26 @@ class RandomImagePlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def add_alias(self, event: AstrMessageEvent):
-        """别名 分类名 别名...:为已有分类绑定新的触发词"""
+        """别名 分类名 别名...:为本会话的已有分类绑定新的触发词"""
         parts = event.message_str.split()
         if len(parts) < 3 or parts[0] != "别名":
             return
+        session = self._session_key(event)
+        categories = self.categories.get(session, {})
         category = parts[1]
-        if category not in self.categories:
+        if category not in categories:
             yield event.plain_result(f"分类「{category}」不存在")
             event.stop_event()
             return
-        bound = self.categories[category]
+        trigger_map = self._trigger_maps.setdefault(session, {})
+        bound = categories[category]
         added, skipped = [], []
         for alias in parts[2:]:
             if (
                 not self._name_error(alias)
                 and alias != category
                 and alias not in bound
-                and alias not in self._trigger_map
+                and alias not in trigger_map
             ):
                 bound.append(alias)
                 added.append(alias)
@@ -213,13 +234,14 @@ class RandomImagePlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def delete_image(self, event: AstrMessageEvent):
-        """删除 分类名 序号:删除该分类下的第 N 张图片(序号见「列表 分类名」)"""
+        """删除 分类名 序号:删除本会话该分类下的第 N 张图片(序号见「列表 分类名」)"""
         parts = event.message_str.split()
         if len(parts) != 3 or parts[0] != "删除":
             return
+        session = self._session_key(event)
         category = parts[1]
-        cat_dir = self.images_dir / category
-        if category not in self.categories or not cat_dir.is_dir():
+        cat_dir = self.images_dir / session / category
+        if category not in self.categories.get(session, {}) or not cat_dir.is_dir():
             yield event.plain_result(f"分类「{category}」不存在")
             event.stop_event()
             return
@@ -248,37 +270,44 @@ class RandomImagePlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def delete_category(self, event: AstrMessageEvent):
-        """删除分类 分类名:删除整个分类及其全部图片"""
+        """删除分类 分类名:删除本会话的整个分类及其全部图片"""
         parts = event.message_str.split()
         if len(parts) != 2 or parts[0] != "删除分类":
             return
+        session = self._session_key(event)
         category = parts[1]
-        if category not in self.categories:
+        categories = self.categories.get(session, {})
+        if category not in categories:
             yield event.plain_result(f"分类「{category}」不存在")
             event.stop_event()
             return
-        del self.categories[category]
+        del categories[category]
+        if not categories:
+            # Drop the empty session bucket to keep the store tidy.
+            self.categories.pop(session, None)
         self._save_categories()
-        shutil.rmtree(self.images_dir / category, ignore_errors=True)
+        shutil.rmtree(self.images_dir / session / category, ignore_errors=True)
         yield event.plain_result(f"已删除分类「{category}」及其全部图片")
         event.stop_event()
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def list_library(self, event: AstrMessageEvent):
-        """列表:查看所有分类;列表 分类名:查看该分类的图片序号"""
+        """列表:查看本会话的所有分类;列表 分类名:查看该分类的图片序号"""
         parts = event.message_str.split()
         if not parts or parts[0] != "列表" or len(parts) > 2:
             return
+        session = self._session_key(event)
+        categories = self.categories.get(session, {})
         if len(parts) == 1:
-            if not self.categories:
+            if not categories:
                 yield event.plain_result(
-                    "图库还是空的,发送「添加 分类名 [图片]」创建第一个分类"
+                    "本会话的图库还是空的,发送「添加 分类名 [图片]」创建第一个分类"
                 )
                 event.stop_event()
                 return
             lines = []
-            for name, aliases in self.categories.items():
-                cat_dir = self.images_dir / name
+            for name, aliases in categories.items():
+                cat_dir = self.images_dir / session / name
                 count = (
                     sum(
                         1
@@ -294,11 +323,11 @@ class RandomImagePlugin(Star):
             event.stop_event()
             return
         category = parts[1]
-        if category not in self.categories:
+        if category not in categories:
             yield event.plain_result(f"分类「{category}」不存在")
             event.stop_event()
             return
-        cat_dir = self.images_dir / category
+        cat_dir = self.images_dir / session / category
         files = (
             sorted(
                 p
@@ -337,17 +366,19 @@ class RandomImagePlugin(Star):
             "· 列表 / 列表 分类名 → 查看图库\n"
             "· 删除 分类名 序号 → 删除单张\n"
             "· 删除分类 分类名 → 删除整个分类\n\n"
+            "图库按会话隔离:每个群聊/私聊拥有独立的分类\n"
             "同一分类内图片按内容自动去重"
         )
         event.stop_event()
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def send_random_image(self, event: AstrMessageEvent):
-        """整条消息等于分类名/别名时,随机发送该分类下的一张图片或 GIF"""
-        category = self._trigger_map.get(event.message_str.strip())
+        """整条消息等于分类名/别名时,随机发送本会话该分类下的一张图片或 GIF"""
+        session = self._session_key(event)
+        category = self._trigger_maps.get(session, {}).get(event.message_str.strip())
         if category is None:
             return
-        cat_dir = self.images_dir / category
+        cat_dir = self.images_dir / session / category
         files = (
             [
                 p
