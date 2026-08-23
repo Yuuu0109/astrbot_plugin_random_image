@@ -40,3 +40,7 @@ data/plugin_data/astrbot_plugin_random_image/
     └── <分类名>/
         └── <sha256>.jpg/.png/.gif/...
 ```
+
+## 许可证
+
+本项目基于 [AGPL-3.0](LICENSE) 许可证开源。
