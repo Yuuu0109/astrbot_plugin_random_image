@@ -1,11 +1,14 @@
+import asyncio
 import hashlib
 import json
 import random
+import re
 import shutil
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Image, Reply
 from astrbot.api.star import Context, Star, StarTools
 
@@ -13,9 +16,20 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 # Maximum number of images accepted in a single "添加" message.
 MAX_BATCH = 50
 # Command words that cannot be used as category names or aliases.
-RESERVED_WORDS = {"添加", "删除", "删除分类", "别名", "列表", "图库帮助"}
+RESERVED_WORDS = {
+    "添加",
+    "删除",
+    "删除分类",
+    "别名",
+    "列表",
+    "每日",
+    "取消每日",
+    "图库帮助",
+}
 # Characters unsafe as directory names on common filesystems.
 INVALID_CHARS = set('/\\:*?"<>|')
+DEFAULT_DAILY_SEND_TIME = "08:00"
+DAILY_TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 
 class RandomImagePlugin(Star):
@@ -26,16 +40,23 @@ class RandomImagePlugin(Star):
     每个群聊/私聊拥有独立图库,互不可见。图片按内容 sha256 命名,同分类内自动去重。
     """
 
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+        self.config = config
+        self.daily_send_time = self._validate_daily_send_time(
+            self.config.get("daily_send_time", DEFAULT_DAILY_SEND_TIME),
+        )
         self.data_dir = StarTools.get_data_dir()
         self.images_dir = self.data_dir / "images"
         self.images_dir.mkdir(parents=True, exist_ok=True)
         self.categories_file = self.data_dir / "categories.json"
+        self.daily_subscriptions_file = self.data_dir / "daily_subscriptions.json"
         # session key -> {category name -> [aliases]}
         self.categories: dict[str, dict[str, list[str]]] = {}
         # session key -> {exact trigger word -> category name}
         self._trigger_maps: dict[str, dict[str, str]] = {}
+        # raw unified_msg_origin -> [category name]
+        self.daily_subscriptions: dict[str, list[str]] = {}
         if self.categories_file.exists():
             try:
                 self.categories = json.loads(
@@ -44,7 +65,47 @@ class RandomImagePlugin(Star):
             except (json.JSONDecodeError, OSError) as e:
                 logger.error(f"[random_image] failed to load categories.json: {e}")
                 self.categories = {}
+        if self.daily_subscriptions_file.exists():
+            try:
+                loaded = json.loads(
+                    self.daily_subscriptions_file.read_text(encoding="utf-8"),
+                )
+                if not isinstance(loaded, dict):
+                    raise ValueError("root value must be an object")
+                self.daily_subscriptions = {
+                    origin: list(dict.fromkeys(categories))
+                    for origin, categories in loaded.items()
+                    if isinstance(origin, str)
+                    and isinstance(categories, list)
+                    and all(isinstance(category, str) for category in categories)
+                }
+            except (json.JSONDecodeError, OSError, ValueError) as e:
+                logger.error(
+                    f"[random_image] failed to load daily_subscriptions.json: {e}",
+                )
+                self.daily_subscriptions = {}
         self._rebuild_trigger_maps()
+        self._daily_task = asyncio.create_task(
+            self._daily_send_loop(),
+            name="random_image_daily_sender",
+        )
+
+    @staticmethod
+    def _validate_daily_send_time(value: object) -> str:
+        """Returns a valid HH:MM daily send time, falling back when invalid."""
+        candidate = str(value).strip()
+        if DAILY_TIME_PATTERN.fullmatch(candidate):
+            return candidate
+        logger.warning(
+            "[random_image] invalid daily_send_time "
+            f"{candidate!r}; using {DEFAULT_DAILY_SEND_TIME}",
+        )
+        return DEFAULT_DAILY_SEND_TIME
+
+    @staticmethod
+    def _storage_key_from_origin(origin: str) -> str:
+        """Converts a raw unified_msg_origin into the existing storage key."""
+        return "".join("_" if c in INVALID_CHARS or c.isspace() else c for c in origin)
 
     def _session_key(self, event: AstrMessageEvent) -> str:
         """Returns a filesystem-safe storage key for the chat session.
@@ -57,7 +118,7 @@ class RandomImagePlugin(Star):
             whose raw format is platform_name:message_type:session_id.
         """
         origin = event.unified_msg_origin or "unknown"
-        return "".join("_" if c in INVALID_CHARS or c.isspace() else c for c in origin)
+        return self._storage_key_from_origin(origin)
 
     def _rebuild_trigger_maps(self) -> None:
         """Rebuilds the per-session keyword -> category tables from self.categories."""
@@ -80,6 +141,46 @@ class RandomImagePlugin(Star):
         except OSError as e:
             logger.error(f"[random_image] failed to save categories.json: {e}")
         self._rebuild_trigger_maps()
+
+    def _save_daily_subscriptions(self) -> None:
+        """Persists per-session daily image subscriptions."""
+        try:
+            self.daily_subscriptions_file.write_text(
+                json.dumps(
+                    self.daily_subscriptions,
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except OSError as e:
+            logger.error(
+                f"[random_image] failed to save daily_subscriptions.json: {e}",
+            )
+
+    def _image_files(self, session: str, category: str) -> list[Path]:
+        """Returns all supported image files in one session category."""
+        cat_dir = self.images_dir / session / category
+        if not cat_dir.is_dir():
+            return []
+        return [
+            path
+            for path in cat_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTS
+        ]
+
+    def _remove_daily_category(self, session: str, category: str) -> bool:
+        """Removes a deleted category from every matching raw session origin."""
+        changed = False
+        for origin, categories in list(self.daily_subscriptions.items()):
+            if self._storage_key_from_origin(origin) != session:
+                continue
+            if category in categories:
+                categories.remove(category)
+                changed = True
+            if not categories:
+                self.daily_subscriptions.pop(origin, None)
+        return changed
 
     def _name_error(self, name: str) -> str | None:
         """Validates a category name or alias.
@@ -286,6 +387,8 @@ class RandomImagePlugin(Star):
             # Drop the empty session bucket to keep the store tidy.
             self.categories.pop(session, None)
         self._save_categories()
+        if self._remove_daily_category(session, category):
+            self._save_daily_subscriptions()
         shutil.rmtree(self.images_dir / session / category, ignore_errors=True)
         yield event.plain_result(f"已删除分类「{category}」及其全部图片")
         event.stop_event()
@@ -365,10 +468,93 @@ class RandomImagePlugin(Star):
             "· 别名 分类名 别名... → 绑定新别名\n"
             "· 列表 / 列表 分类名 → 查看图库\n"
             "· 删除 分类名 序号 → 删除单张\n"
-            "· 删除分类 分类名 → 删除整个分类\n\n"
+            "· 删除分类 分类名 → 删除整个分类\n"
+            "· 每日 分类名 → 每天定时发送该分类的一张随机图片\n"
+            "· 每日 → 查看本会话已开启的每日分类\n"
+            "· 取消每日 分类名 → 停止该分类的每日发送\n\n"
             "图库按会话隔离:每个群聊/私聊拥有独立的分类\n"
-            "同一分类内图片按内容自动去重"
+            "同一分类内图片按内容自动去重\n"
+            f"当前每日发图时间:{self.daily_send_time}"
         )
+        event.stop_event()
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def manage_daily_image(self, event: AstrMessageEvent):
+        """每日 分类名:开启每日随机图;每日:查看;取消每日 分类名:关闭"""
+        parts = event.message_str.split()
+        if not parts or parts[0] not in {"每日", "取消每日"}:
+            return
+
+        command = parts[0]
+        if command == "每日" and len(parts) == 1:
+            categories = self.daily_subscriptions.get(
+                event.unified_msg_origin or "",
+                [],
+            )
+            if categories:
+                yield event.plain_result(
+                    f"本会话的每日分类:{'、'.join(categories)}\n"
+                    f"全局发送时间:{self.daily_send_time}",
+                )
+            else:
+                yield event.plain_result(
+                    "本会话尚未开启每日随机图\n"
+                    f"发送「每日 分类名」开启,全局发送时间:{self.daily_send_time}",
+                )
+            event.stop_event()
+            return
+
+        if len(parts) != 2:
+            usage = "每日 分类名" if command == "每日" else "取消每日 分类名"
+            yield event.plain_result(f"用法:{usage}")
+            event.stop_event()
+            return
+
+        origin = event.unified_msg_origin
+        if not origin:
+            yield event.plain_result("无法识别当前会话,请稍后重试")
+            event.stop_event()
+            return
+
+        session = self._session_key(event)
+        requested = parts[1]
+        category = self._trigger_maps.get(session, {}).get(requested)
+        subscriptions = self.daily_subscriptions.get(origin, [])
+        if category is None and command == "取消每日" and requested in subscriptions:
+            # Allow a stale subscription to be removed even if its category was
+            # manually deleted from the data directory.
+            category = requested
+        if category is None:
+            yield event.plain_result(f"分类或别名「{requested}」不存在")
+            event.stop_event()
+            return
+
+        if command == "每日":
+            if category in subscriptions:
+                yield event.plain_result(
+                    f"「{category}」已开启每日随机图,发送时间:{self.daily_send_time}",
+                )
+                event.stop_event()
+                return
+            subscriptions = self.daily_subscriptions.setdefault(origin, [])
+            subscriptions.append(category)
+            self._save_daily_subscriptions()
+            yield event.plain_result(
+                f"已开启「{category}」每日随机图\n"
+                f"每天 {self.daily_send_time} 自动发送一张",
+            )
+            event.stop_event()
+            return
+
+        if category not in subscriptions:
+            yield event.plain_result(f"「{category}」尚未开启每日随机图")
+            event.stop_event()
+            return
+        subscriptions.remove(category)
+        if not subscriptions:
+            self.daily_subscriptions.pop(origin, None)
+        self._save_daily_subscriptions()
+        yield event.plain_result(f"已取消「{category}」每日随机图")
         event.stop_event()
 
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -378,16 +564,7 @@ class RandomImagePlugin(Star):
         category = self._trigger_maps.get(session, {}).get(event.message_str.strip())
         if category is None:
             return
-        cat_dir = self.images_dir / session / category
-        files = (
-            [
-                p
-                for p in cat_dir.iterdir()
-                if p.is_file() and p.suffix.lower() in IMAGE_EXTS
-            ]
-            if cat_dir.is_dir()
-            else []
-        )
+        files = self._image_files(session, category)
         if not files:
             yield event.plain_result(
                 f"分类「{category}」还没有图片,发送「添加 {category} [图片]」来添加"
@@ -397,5 +574,74 @@ class RandomImagePlugin(Star):
         yield event.chain_result([Image.fromFileSystem(str(random.choice(files)))])
         event.stop_event()
 
+    async def _send_daily_images(self) -> None:
+        """Sends one random image for every enabled session/category pair."""
+        if not self.daily_subscriptions:
+            logger.info("[random_image] no daily image subscriptions to send")
+            return
+
+        logger.info("[random_image] starting daily image delivery")
+        for origin, categories in list(self.daily_subscriptions.items()):
+            session = self._storage_key_from_origin(origin)
+            for category in list(categories):
+                files = self._image_files(session, category)
+                if not files:
+                    logger.warning(
+                        "[random_image] skipped daily image: "
+                        f"session={origin}, category={category}, no images found",
+                    )
+                    continue
+                image_path = random.choice(files)
+                try:
+                    sent = await self.context.send_message(
+                        origin,
+                        MessageChain().file_image(str(image_path)),
+                    )
+                    if not sent:
+                        logger.warning(
+                            "[random_image] daily image platform unavailable: "
+                            f"session={origin}, category={category}",
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "[random_image] failed to send daily image: "
+                        f"session={origin}, category={category}, error={e}",
+                    )
+
+    async def _daily_send_loop(self) -> None:
+        """Waits until the configured local time and delivers daily images."""
+        hour, minute = (int(part) for part in self.daily_send_time.split(":"))
+        while True:
+            try:
+                now = datetime.now()
+                target = now.replace(
+                    hour=hour,
+                    minute=minute,
+                    second=0,
+                    microsecond=0,
+                )
+                if target <= now:
+                    target += timedelta(days=1)
+                wait_seconds = (target - now).total_seconds()
+                logger.info(
+                    "[random_image] next daily image delivery: "
+                    f"{target.strftime('%Y-%m-%d %H:%M')}",
+                )
+                await asyncio.sleep(wait_seconds)
+                await self._send_daily_images()
+            except asyncio.CancelledError:
+                logger.info("[random_image] daily image task cancelled")
+                raise
+            except Exception as e:
+                logger.error(f"[random_image] daily image loop failed: {e}")
+                await asyncio.sleep(60)
+
     async def terminate(self):
-        """Optional plugin teardown hook."""
+        """Cancels the daily sender during plugin teardown/reload."""
+        if self._daily_task.done():
+            return
+        self._daily_task.cancel()
+        try:
+            await self._daily_task
+        except asyncio.CancelledError:
+            pass

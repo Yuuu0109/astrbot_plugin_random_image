@@ -1,6 +1,6 @@
 name: astrbot_plugin_random_image
 display_name: 关键词随机图库
-desc: 发送关键词随机发送该分类下的图片/GIF,图库按会话(群聊/私聊)隔离,支持中文语句管理(添加/引用添加/别名/列表/删除),按内容自动去重
-version: v1.1.0
+desc: 发送关键词随机发送该分类下的图片/GIF,图库按会话(群聊/私聊)隔离,支持中文语句管理与每日定时随机发图,按内容自动去重
+version: v1.2.0
 author: Yuuuu0109
 repo: https://github.com/Yuuu0109/astrbot_plugin_random_image.git
