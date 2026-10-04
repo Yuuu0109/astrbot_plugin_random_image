@@ -20,6 +20,7 @@ RESERVED_WORDS = {
     "添加",
     "删除",
     "删除分类",
+    "清理",
     "别名",
     "列表",
     "每日",
@@ -394,6 +395,71 @@ class RandomImagePlugin(Star):
         event.stop_event()
 
     @filter.event_message_type(filter.EventMessageType.ALL)
+    async def cleanup_records(self, event: AstrMessageEvent):
+        """清理 [分类名]:清理本会话中已无图片的分类残留记录(图片被手动删除时使用)"""
+        parts = event.message_str.split()
+        if not parts or parts[0] != "清理" or len(parts) > 2:
+            return
+        session = self._session_key(event)
+        categories = self.categories.get(session, {})
+        if not categories:
+            yield event.plain_result("本会话的图库还是空的,没有需要清理的记录")
+            event.stop_event()
+            return
+        single = len(parts) == 2
+        if single and parts[1] not in categories:
+            yield event.plain_result(f"分类「{parts[1]}」不存在")
+            event.stop_event()
+            return
+
+        targets = [parts[1]] if single else list(categories)
+        cleaned, unsubscribed, remaining = [], [], 0
+        for category in targets:
+            files = self._image_files(session, category)
+            if files:
+                remaining = len(files)
+                continue
+            # The record survived but no image is left on disk: drop the stale
+            # entry, its daily subscription and the leftover empty directory.
+            del categories[category]
+            cleaned.append(category)
+            if self._remove_daily_category(session, category):
+                unsubscribed.append(category)
+            try:
+                (self.images_dir / session / category).rmdir()
+            except OSError:
+                pass
+
+        if not cleaned:
+            if single:
+                yield event.plain_result(
+                    f"分类「{parts[1]}」还有 {remaining} 张图片,无需清理"
+                )
+            else:
+                yield event.plain_result(
+                    "没有发现残留的分类记录,图库记录与实际图片一致"
+                )
+            event.stop_event()
+            return
+
+        if not categories:
+            # Drop the empty session bucket to keep the store tidy.
+            self.categories.pop(session, None)
+            try:
+                (self.images_dir / session).rmdir()
+            except OSError:
+                pass
+        self._save_categories()
+        if unsubscribed:
+            self._save_daily_subscriptions()
+
+        reply = f"已清理 {len(cleaned)} 个无图片的分类记录:{'、'.join(cleaned)}"
+        if unsubscribed:
+            reply += f"\n已同步取消每日订阅:{'、'.join(unsubscribed)}"
+        yield event.plain_result(reply)
+        event.stop_event()
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
     async def list_library(self, event: AstrMessageEvent):
         """列表:查看本会话的所有分类;列表 分类名:查看该分类的图片序号"""
         parts = event.message_str.split()
@@ -469,6 +535,7 @@ class RandomImagePlugin(Star):
             "· 列表 / 列表 分类名 → 查看图库\n"
             "· 删除 分类名 序号 → 删除单张\n"
             "· 删除分类 分类名 → 删除整个分类\n"
+            "· 清理 [分类名] → 清理已无图片的分类残留记录\n"
             "· 每日 分类名 → 每天定时发送该分类的一张随机图片\n"
             "· 每日 → 查看本会话已开启的每日分类\n"
             "· 取消每日 分类名 → 停止该分类的每日发送\n\n"
